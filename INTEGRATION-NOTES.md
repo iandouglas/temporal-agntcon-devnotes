@@ -49,9 +49,12 @@ Three moving parts:
 - **`./mcp`** — a remote MCP server. Each configured service becomes one
   **zero-argument MCP tool**. Every `tools/call` starts a Temporal workflow and
   **blocks until the work actually completed**.
-- **`./audience-site`** — the chaos machine. A QR-code page with five switches
-  (the MCP connection plus the four APIs). Every tap POSTs `/on` or `/off` to
-  that service. The floor is locked until the operator opens it from `/control`.
+- **`./audience-site`** — the chaos machine. A QR-code page where every viewer
+  is assigned to the **breakers** or the **fixers** and gets one button per
+  component (the MCP connection plus the four APIs). Votes are tallied per
+  component and the component is up while the fixers hold at least half; only a
+  vote that *flips* that calls `/on` or `/off`. The floor is locked until the
+  operator opens it from `/control`. See §6.3.
 
 ## 1.1 Live deployment (Railway, project `agentcon-demo`)
 
@@ -85,12 +88,17 @@ Temporal directly it must run inside this Railway project and dial
 `temporal.railway.internal:7233`.
 
 Scale, as deployed: the four Go services 2 replicas each, `mcp-worker` 2,
-**`audience-site` 5**, everything else 1. All services capped at 2 vCPU / 2 GB
-except Temporal at 4 vCPU / 8 GB. Verified: with 5 board replicas, 20
-simultaneous clients all saw both a peer's tap and an operator force, so the
-Redis fanout holds at that width.
+**`audience-site` 1**, everything else 1. All services capped at 2 vCPU / 2 GB
+except Temporal at 4 vCPU / 8 GB.
 
-**Turning the demo on.** The board ships locked and every switch is inert until
+The board runs on a single replica deliberately. Vote deltas and renames do
+replicate over Redis — verified with two replicas, and with 20 simultaneous
+clients all seeing a peer's vote — but for an audience of ~150 one replica is
+ample and it removes a whole class of failure from the stage. The cost is that a
+redeploy drops every phone at once rather than a fraction of them, which is fine
+because nothing is being redeployed mid-demo.
+
+**Turning the demo on.** The board ships locked and every button is inert until
 an operator opens the floor. Either press **START THE DEMO** on the rehearsal
 console above, or send `{"t":"arm","v":true}` on the control socket. Nothing the
 audience does registers before that.
@@ -129,10 +137,10 @@ Design consequences for your dashboard:
 - **`attempts` in the response is your "how broken was it" metric.** A taco that
   came back on attempt 1 sailed through; one that came back on attempt 400 sat
   through a ~100 second outage.
-- **You cannot detect switch state from the MCP call path, by design.** A
-  toggled-off tool is absorbed as a retryable failure and is indistinguishable
-  from a dead downstream. Get switch state from the audience-site (§6.3), never
-  by inferring it from tool behaviour.
+- **You cannot detect component state from the MCP call path, by design.** A
+  component the room has voted down is absorbed as a retryable failure and is
+  indistinguishable from a dead downstream. Get state from the audience-site
+  (§6.3), never by inferring it from tool behaviour.
 
 ---
 
@@ -447,44 +455,125 @@ version of the `state` block), `POST /admin/control`
 ### 6.3 The audience-site — what the crowd just broke
 
 This one **is** public HTTPS and browser-reachable today, and it is the right
-source for "which switch is currently off".
+source for "which component is currently down".
 
-**WebSocket** — `wss://<audience-host>/ws?role=control&token=<admin_token>`
+> **This section changed on 2026-09-11.** The board used to be five on/off
+> toggles that anyone could flip. It is now a **breaker-vs-fixer tug of war**.
+> If you built against booleans, read on — the boolean is still there, but it is
+> now derived rather than set.
 
-Server → client messages (see `audience-site/src/lib/types.ts`):
+#### The model
+
+Every viewer is assigned a **team** on first load — round-robin, so the sides
+stay even — and pinned to it by a `mep_role` cookie so a reload keeps them where
+they were. Each team gets exactly one button per component: **BREAK** for
+breakers, **FIX** for fixers. All five components take part, the agent ↔ MCP
+connection included.
+
+Each component carries a **vote tally**, not a flag:
+
+```jsonc
+{ "breaks": 156, "fixes": 44, "on": false }
+```
+
+`on` is **derived, never stored**: a component is up while the fixers hold at
+least half the vote. Fixer share ≥ 50% reduces to `fixes >= breaks`, so:
+
+| Votes | Bar | Component |
+|---|---|---|
+| 0–0 | 50 / 50 | **up** — a tie counts as the fixers holding half |
+| 1 break | 100 / 0 breaks | down |
+| 1 break, 1 fix | 50 / 50 | up |
+| 2 breaks, 1 fix | 66 / 33 | down |
+
+**A vote always moves the bar. Only a vote that flips `on` calls the service.**
+A room full of thumbs on one button produces one POST, not hundreds a second.
+This is why you will see the tally climb continuously while `state` events
+arrive only at crossings.
+
+#### WebSocket
+
+`wss://<audience-host>/ws?role=control&token=<admin_token>`
+
+Server → client (see `audience-site/src/lib/types.ts`):
 
 | Message | Meaning |
 |---|---|
-| `{t:"hello", state, armed, ts}` | Sent on connect. `state` is `{service_1: true, mcp: false, …}` |
-| `{t:"state", id, v, ts}` | One switch moved |
+| `{t:"hello", state, tallies, names, role, armed, ts}` | On connect. `state` is the derived booleans, `tallies` the vote counts, `names` the display names, `role` your team |
+| `{t:"tallies", tallies, ts}` | Vote counts changed. Throttled to ~8/sec, whole snapshot not a diff, so a dropped frame self-corrects |
+| `{t:"state", id, v, ts}` | A component crossed the line and was actually called. **Still emitted — the old boolean contract works unchanged** |
+| `{t:"names", names, ts}` | A component was renamed live (§6.3.2) |
 | `{t:"armed", v, ts}` | Operator opened/closed the floor |
-| `{t:"full", state, ts}` | Full resync (after a Redis outage or reseed) |
+| `{t:"full", state, ts}` | Full resync after a Redis outage or reseed |
 | `{t:"stats", conns, taps, dispatch, bus}` | **Control role only**, once per second |
 
-`stats` is rich: `conns` is phones connected across all replicas, `taps` is a
-per-switch tap count, `dispatch` is the last outbound POST per service with its
-status and latency, and `bus` is `OK`/degraded for Redis.
+Client → server: `{t:"vote", id}` is the only thing an audience socket may send.
+`arm`, `force`, `reset-counters` and `set-name` are accepted **only** on a
+control socket; an audience socket sending them is ignored, not errored.
+
+`stats` carries `conns` (phones connected, summed across replicas), `taps` (raw
+click count per component, which includes clicks the rate limiter dropped),
+`dispatch` (last outbound POST per service with status and latency) and `bus`
+(Redis health).
 
 Send `{t:"ping"}` to keep it warm; the server also pings every 25s. Reconnect
-with backoff — the client hook in `audience-site/src/hooks/useSwitchboard.ts`
-is a working reference.
+with backoff — `audience-site/src/hooks/useSwitchboard.ts` is a working
+reference.
 
-**Or poll REST:** `GET https://<audience-host>/api/admin/state` with
-`Authorization: Bearer <admin_token>` returns the same state plus `conns`,
-`armed`, `bus`, `pool`, and the service list.
+**Or poll REST:** `GET /api/admin/state` with `Authorization: Bearer
+<admin_token>` returns `state`, `names`, `armed`, `conns`, `bus`, `pool` and the
+service list. It does **not** currently include `tallies` — use the socket for
+those.
 
-**Mapping switch ids to tool names.** The audience-site identifies switches
-positionally (`mcp`, `service_1` … `service_4`); the MCP server identifies tools
-by sanitized name (`order_taco`). The join is **the index N**: `service_1` on
-the board is the tool built from `service_1_name` on the MCP server. This only
-holds if both apps are configured with matching `service_N_name` values — see
-[Open items](#open-items-ian--melissa-must-close).
+#### Mapping components to tool names
 
-Note also that `service_N_url` means different things in the two apps: on the
-audience-site it is a **base** URL (`http://taco.railway.internal:8080`), on the
-MCP server it is the **full endpoint** (`http://taco.railway.internal:8080/taco`).
+The board identifies components positionally (`mcp`, `service_1` … `service_4`);
+the MCP server identifies tools by sanitized name (`order_taco`). The join is
+**the index N**: `service_1` on the board is the tool built from
+`service_1_name`. Joining by name is not safe — see §6.3.1.
 
-### 6.3.1 The `chaos_snapshot` contract v2 defines
+Note `service_N_url` means different things in the two apps: on the board it is
+a **base** URL (`http://taco.railway.internal:8080`), on the MCP server it is
+the **full endpoint** (`http://taco.railway.internal:8080/taco`). Both are
+assembled from the same shared variables, so a host change reaches both.
+
+#### 6.3.1 Display names are live-editable, and may differ from tool names
+
+Component display names live in Redis and can be changed **without a redeploy or
+a page reload**: `POST /api/admin/name?id=service_2&name=Order%20Churro` with the
+admin bearer, or inline on `/control`. Every connected phone relabels in place
+and a `names` frame goes out.
+
+`service_N_name` is only the **seed** — Redis wins once a name has been set, so
+a restart will not put the old one back.
+
+⚠️ **The MCP server still derives its tool names from `service_N_name`.** That is
+deliberate: a tool name is a contract an agent may be mid-call against, so
+renaming it live would break in-flight work. A display name is cosmetic. So the
+board can read "Order Churro" while the tool is still `order_coffee`. Harmless
+for the join (that is by index), but **label your dashboard from `/healthz` or
+from the board's `names`, and do not assume the two agree.**
+
+#### Operator controls that affect what you see
+
+- **The floor is locked until an operator opens it.** Every button renders but
+  does nothing, and `armed:false` says so. Nothing the audience does registers
+  before that.
+- **RESET COUNTERS** returns every tally to 0–0 *and drives anything that was
+  down back up*, because the tally is the board's source of truth and must not
+  disagree with reality. Expect a burst of `state` events and a `tallies` frame.
+  It is the pre-show reset, and it also un-sticks a bar that has gone rigid.
+- **Operator force** (ALL ON / ALL OFF, or a single component) moves the tally
+  too, for the same reason.
+
+#### Operational notes
+
+Vote counts are persisted to Redis and recovered on boot, so a restart
+mid-demo does not reset the game. The board runs as a **single replica** for the
+demo; vote deltas and renames do replicate over Redis if it is scaled up, but
+one replica removes a class of risk that is not worth carrying on stage.
+
+### 6.3.2 The `chaos_snapshot` contract v2 defines
 
 v2's stage prototype states that its own state object "is deliberately the same
 shape the FastAPI backend will push over SSE, so this file doubles as the API
@@ -518,10 +607,35 @@ Melissa's backend emits this, but three of its fields are owned by this repo:
 `connected` and `damage_per_tap` come from the audience site, `health` for
 `mcp_worker` / `payment_api` / `email_api` comes from the audience site, and
 `activity_attempts` / `activities_completed` / `duplicates_prevented` come from
-the MCP server's Temporal workflows. Today the audience site publishes `conns`,
-per-switch **booleans** and tap counts over its own WebSocket and
-`GET /api/admin/state` (§6.3) — the right data, the wrong shape. Reconciling
-those two is open item 0.
+the MCP server's Temporal workflows.
+
+**The gap is much smaller than it was.** The board now has exactly the concepts
+v2 asked for — fixer and breaker teams, a per-component contest, and a
+continuous value rather than a flag:
+
+| v2 field | Where it comes from now |
+|---|---|
+| `connected` | `stats.conns` on the control socket |
+| `health` (0–100) | `tallies[id]` → `round(fixes / (fixes + breaks) * 100)`. A 0–0 tie is 50 |
+| `damage_per_tap` | Implicit. One click is one vote, so the *effect* of a tap shrinks as the total grows — see the caveat below |
+| `run`, `scoreboard` | Not the board's. Temporal and your own ledger |
+
+What is still unreconciled is the **shape and the cadence**: v2 wants one
+`chaos_snapshot` every 200ms carrying everything, and the board emits several
+narrower frames (`tallies` at ~8/sec, `state` on crossings, `names` on rename).
+Somebody has to write that adapter. **Who owns it is the live question** — the
+board could emit v2's shape, or your backend could assemble it from the board's
+frames plus your own state. The board's frames are already whole snapshots, not
+diffs, so either direction is mechanical.
+
+⚠️ **The `damage_per_tap` caveat.** Because health is a *ratio*, a click's
+effect shrinks as votes accumulate: at 400–400 one tap moves the bar 0.1%. There
+is no fixed damage number to publish, and late in a heavily-voted round the
+percentage will look frozen while the raw counts keep climbing. This is why the
+board shows both — `22% (44 fixes) … (156 breaks) 78%`. If your dashboard needs
+a bar that stays responsive all round, either narrate the counts rather than the
+percentage, or ask Ian for a decaying/windowed health instead of a cumulative
+ratio. `RESET COUNTERS` un-sticks it instantly.
 
 ### 6.4 Temporal Cloud directly
 
@@ -572,7 +686,7 @@ so a typo does not spend fourteen minutes looking identical to the demo.
 | Railway hard request cap | 15 min | the absolute ceiling on one blocking call |
 | `/admin/live` poll | 500ms | your SSE update rate |
 | `tools/list` TTL | 30s, `private` scope | do not cache in a shared cache |
-| audience-site per-socket rate cap | 5/sec, burst 10 | throttles the outbound POST only; the switch still moves |
+| audience-site per-socket rate cap | 5/sec, burst 10 | caps how fast one phone can vote. Dropped clicks are still counted in `stats.taps`, so that number runs ahead of `tallies` |
 
 > **Measured, not assumed.** The attempt counter climbs at **1.00/sec**, not
 > ~4/sec. The gaps between consecutive activity attempts, read off the worker's
@@ -679,8 +793,8 @@ the dashboard side alone. Raise them with Ian.
    | a | `order_a_taco`, `order_more_inventory`, `take_payment`, `email_receipt` (+ `get_specials` in the run plan — 4 or 5 tools?) | `order_taco`, `order_coffee`, `restock_inventory`, `send_receipt` | **Cheap.** Tool names are derived from `service_N_name`, so this is env vars plus one more `./service` deploy if it is five |
    | b | `order_more_inventory("chicken", 40)` — tools take arguments | Zero-argument by design (DESIGN.md decision 4): the URL is POSTed with an empty body and there is no input-schema mechanism at all | **Real work.** `mcp_app.py`, `activities.py` and the config all need per-tool input schemas |
    | c | `order_a_taco() → out_of_stock` as a *business outcome* the agent re-plans around | `./service` has exactly two states: `200 {"<name>":true}` or a bare `500`. No third state | **Moderate.** Needs an "out of stock" mode in `./service`; the MCP classification already passes any 2xx body through |
-   | d | Health **0–100** per component, with `damage_per_tap`, fixer/breaker roles, room mood, and auto-restart to health 30 after 5s | Binary on/off, one Redis flag per service | **Real work**, mostly in the audience site. Cleanest seam: keep `./service` binary (down = health 0) and hold the HP in the audience site |
-   | e | Six chaos targets: `llm_api`, `agent_worker`, `mcp_link` (Melissa's) + `mcp_worker`, `payment_api`, `email_api` (ours). Inventory and delivery are *steps, not targets* | Five switches: `mcp` + `service_1..4`, all ours | **Moderate.** The board needs three targets it does not own, and drops two it does |
+   | d | Health **0–100** per component, with `damage_per_tap`, fixer/breaker roles, room mood, and auto-restart to health 30 after 5s | **Mostly built.** Fixer/breaker teams, per-component contest, continuous health as a vote ratio (§6.3). `./service` stayed binary and the contest lives in the board, as suggested | **Shape only.** What remains is the adapter to v2's single `chaos_snapshot` frame, plus decisions on room mood and auto-restart, which are not built. `damage_per_tap` has no fixed value because health is a ratio — see §6.3.2 |
+   | e | Six chaos targets: `llm_api`, `agent_worker`, `mcp_link` (Melissa's) + `mcp_worker`, `payment_api`, `email_api` (ours). Inventory and delivery are *steps, not targets* | Five components: `mcp` + `service_1..4`, all ours | **Moderate.** The board needs three targets it does not own, and drops two it does |
    | f | `take_payment()` interrupted mid-flight resumes and charges **once** ("workflow-id dedup · ran exactly once"), feeding `duplicates_prevented` | One activity that POSTs once. A worker killed mid-activity retries the whole POST, and the missing `id_reuse_policy` (§4) lets a *completed* id start a second run | **One line, plus a decision.** The reuse-policy fix closes the dedup hole if Melissa passes `tool_call_id` as `_meta.idempotencyKey`. True mid-tool resumption would need tool-as-workflow |
 
    Note b, d and f are the ones with real design content. b and d are the two
@@ -693,7 +807,11 @@ the dashboard side alone. Raise them with Ian.
    read-only public relay; (c) you read Temporal Cloud directly (§6.4). Until
    one of these is chosen, build against §6.1 + §6.3, which work today.
 
-2. **The audience-site's MCP switch does not currently do anything.** The site
+2. **The audience-site's MCP control does not currently do anything.** Since
+   the tug-of-war rework it has a real BREAK/FIX pair, the votes tally and the
+   bar moves — but the outbound call still goes nowhere, so the teams can fight
+   over the agent ↔ MCP connection and nothing happens to it. One of the five
+   cards is inert on stage. The site
    POSTs `{mcp_url}/on` and `{mcp_url}/off` with no auth, but the MCP server has
    no `/on` or `/off` route — it expects
    `POST /admin/control {"target":"global","enabled":false}` with an admin

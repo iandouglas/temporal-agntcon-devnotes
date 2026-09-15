@@ -1,6 +1,6 @@
 # Notes for Melissa — integrating your side with Ian's
 
-**As of 2026-09-10.** Everything below is deployed and verified end to end.
+**As of 2026-09-15.** Everything below is deployed and verified end to end.
 Full detail lives in `INTEGRATION-NOTES.md`; this is the call sheet.
 
 ---
@@ -84,9 +84,9 @@ Zero-argument tools: `arguments` is always `{}`.
   something and drains to zero when they fix it.
 - **`attempts` is your "how broken was it" metric** — and see §4, it is
   effectively a stopwatch in seconds.
-- **You cannot detect switch state from the call path.** A toggled-off service
-  is absorbed as a retryable failure, indistinguishable from a dead one. Get
-  switch state from the board (§5), never by inferring it.
+- **You cannot detect component state from the call path.** A component the room
+  has voted down is absorbed as a retryable failure, indistinguishable from a
+  dead one. Get state from the board (§5), never by inferring it.
 
 ---
 
@@ -109,9 +109,31 @@ second" anyway. Do not hardcode either rate in a label.
 
 ---
 
-## 5. Live switch state — what the crowd just broke
+## 5. Live component state — what the crowd just broke
 
-**WebSocket (recommended):**
+> **Changed 2026-09-11.** The board used to be five on/off switches anyone could
+> flip. It is now a **breaker-vs-fixer tug of war**. The boolean you may have
+> built against still exists — it is just derived now instead of set.
+
+Every viewer is put on a **team** at first load (round-robin, pinned by a
+`mep_role` cookie) and gets one button per component: **BREAK** or **FIX**. All
+five take part, the agent ↔ MCP connection included.
+
+Each component carries a vote tally rather than a flag:
+
+```jsonc
+{ "breaks": 156, "fixes": 44, "on": false }
+```
+
+`on` is derived: **up while the fixers hold at least half the vote**, which
+reduces to `fixes >= breaks`. So a 0–0 tie starts every component up, and the
+first vote either way swings the bar to an end.
+
+**A vote always moves the bar; only a vote that flips `on` calls the service.**
+Expect the tally to climb continuously while `state` events arrive only at
+crossings — that is the design, not a dropped message.
+
+### WebSocket
 
 ```
 wss://audience-site-production.up.railway.app/ws?role=control&token=<admin token>
@@ -119,28 +141,65 @@ wss://audience-site-production.up.railway.app/ws?role=control&token=<admin token
 
 | Message | Meaning |
 |---|---|
-| `{t:"hello", state, armed, ts}` | on connect. `state` is `{mcp:false, service_1:true, …}` |
-| `{t:"state", id, v, ts}` | one switch moved |
+| `{t:"hello", state, tallies, names, role, armed, ts}` | on connect |
+| `{t:"tallies", tallies, ts}` | vote counts changed — ~8/sec, whole snapshot, a dropped frame self-corrects |
+| `{t:"state", id, v, ts}` | a component crossed the line and was actually called |
+| `{t:"names", names, ts}` | a component was renamed live |
 | `{t:"armed", v, ts}` | operator opened/closed the floor |
 | `{t:"full", state, ts}` | full resync |
 | `{t:"stats", conns, taps, dispatch, bus}` | control role only, once per second |
 
-`conns` is phones connected across all replicas, `taps` is per-switch tap
-counts, `dispatch` is the last outbound POST per service with status and
-latency, `bus` is Redis health. Reconnect with backoff; the server pings every
-25s. A working client hook is `audience-site/src/hooks/useSwitchboard.ts`.
+`stats.conns` is phones connected. `stats.taps` is raw clicks including ones the
+rate limiter dropped, so it runs **ahead of** `tallies` — use `tallies` for the
+bars and `taps` only as a crowd-energy number.
 
-**Or poll REST:** `GET /api/admin/state` with `Authorization: Bearer <admin token>`.
+**Or poll REST:** `GET /api/admin/state` with the admin bearer gives `state`,
+`names`, `armed`, `conns`, `bus`, `pool`. It does **not** include `tallies` —
+use the socket for those.
 
-**Joining a switch to a tool: the index N.** `service_1` on the board is the
-tool built from `service_1_name`. Those names are now Railway *shared
-variables* consumed by both apps, so they cannot drift — that risk is closed.
+### Getting health 0–100 out of it
 
-**The board is locked until Ian opens the floor.** Every switch renders but does
-nothing beforehand, and `armed:false` tells you so. Nothing the audience does
-registers before that.
+```
+health[id] = round(fixes / (fixes + breaks) * 100)     // 0-0 tie → 50
+```
 
----
+That is your `health` field. **But it is a ratio, so a click's effect shrinks as
+votes pile up** — at 400–400 one tap moves it 0.1%, and late in a round the
+percentage looks frozen while the counts keep climbing. There is therefore no
+fixed `damage_per_tap` to publish.
+
+The board shows both numbers for exactly this reason:
+
+```
+22% (44 fixes)    UP    (156 breaks) 78%
+```
+
+If your dashboard needs a bar that stays lively all round, narrate the counts
+rather than the percentage, or ask Ian for a windowed/decaying health instead of
+a cumulative ratio. `RESET COUNTERS` un-sticks it instantly.
+
+### Joining a component to a tool
+
+By **index**, not by name. `service_1` on the board is the tool built from
+`service_1_name`.
+
+Do not join by name: display names are now **live-editable** from Redis
+(`POST /api/admin/name?id=service_2&name=Order%20Churro`, or inline on
+`/control`) and every phone relabels without a reload — but the **MCP server
+still takes its tool names from the env var**. That is deliberate: a tool name
+is a contract you may be mid-call against, so renaming it live would break
+in-flight work. The consequence is that the board can read "Order Churro" while
+the tool is still `order_coffee`. Label from `/healthz` or from the board's
+`names`, and do not assume they agree.
+
+### Things that will move the board without the audience touching it
+
+- **The floor is locked until Ian opens it.** Buttons render and do nothing;
+  `armed:false` tells you.
+- **RESET COUNTERS** zeroes every tally *and drives anything down back up*.
+  Expect a burst of `state` events. It is the pre-show reset.
+- **Operator force** (ALL ON / ALL OFF) moves the tally too, so the board never
+  disagrees with reality.
 
 ## 6. Where our contracts still differ
 
@@ -148,11 +207,11 @@ Your v2 spec and what exists differ in ways worth deciding on this call.
 
 | Your v2 expects | Built today | Cost |
 |---|---|---|
-| `chaos_snapshot` every 200ms: full state, `seq`, `health` 0–100 per component, `damage_per_tap`, `scoreboard` | The board pushes `conns`, per-switch **booleans** and tap counts over its own WebSocket | **Right data, wrong shape.** Needs a translation layer, on one side or the other |
-| Health **0–100** with damage-per-tap, fixer/breaker roles, auto-heal | Binary on/off, one Redis flag per service | **Real work**, mostly in the board. Cleanest seam: keep the services binary (down = health 0) and hold the HP in the board |
+| `chaos_snapshot` every 200ms: full state, `seq`, `health` 0–100 per component, `damage_per_tap`, `scoreboard` | The board pushes `tallies` (~8/sec), `state` on crossings and `names` on rename — all whole snapshots, not diffs | **Shape and cadence only.** An adapter either way; the data is there. **Who writes it is decision 3 below** |
+| Health **0–100** with damage-per-tap, fixer/breaker roles, auto-heal | **Mostly built.** Teams, per-component contest and continuous health as a vote ratio (§5). Services stayed binary and the contest lives in the board, as you suggested | **Small.** No `damage_per_tap` value exists because health is a ratio (§5). Room mood and auto-heal are not built |
 | Tools take arguments, e.g. `order_more_inventory("chicken", 40)` | **Zero-argument by design.** No input-schema mechanism at all | **Real work** in `mcp_app.py` + `activities.py` + config |
 | `out_of_stock` as a business outcome the agent re-plans around | Two states only: `200 {"<name>":true}` or a bare `500` | **Moderate.** Needs a third mode in the Go service |
-| Six chaos targets incl. `llm_api`, `agent_worker`, `mcp_link` (yours) | Five switches: `mcp` + `service_1..4`, all Ian's | **Moderate.** The board needs three targets it does not own |
+| Six chaos targets incl. `llm_api`, `agent_worker`, `mcp_link` (yours) | Five components: `mcp` + `service_1..4`, all Ian's | **Moderate.** The board needs three targets it does not own |
 | Tool names `order_a_taco`, `take_payment`, … | `order_taco`, `order_coffee`, `restock_inventory`, `send_receipt` | **Cheap** — env vars, plus one more service deploy if it is five tools |
 
 The two with real design content are **arguments** and **0–100 health**. The
@@ -167,10 +226,13 @@ rest is configuration or a shim.
    elsewhere, Ian needs to expose port **8081** publicly (see §8).
 2. **Tool names and order** — currently 1 taco, 2 coffee, 3 inventory,
    4 receipt. Four tools or five?
-3. **Who owns the `chaos_snapshot` translation** — does the board start emitting
-   your shape, or does your backend consume the board's?
-4. **Health: booleans or 0–100?** If 0–100, the HP lives in the board and the
-   services stay binary.
+3. **Who owns the `chaos_snapshot` adapter** — does the board start emitting your
+   single 200ms frame, or does your backend assemble it from the board's frames
+   plus your own state? The board's frames are already whole snapshots, so
+   either direction is mechanical. This is the one that blocks you.
+4. ~~**Health: booleans or 0–100?**~~ **Settled** — 0–100, derived from the vote
+   ratio, HP in the board, services binary. Read §5 for the formula and the
+   ratio caveat.
 5. **Do tools need arguments?** This is the expensive one. Zero-argument today.
 6. **Idempotency:** pass your `tool_call_id` as `_meta.idempotencyKey` on every
    call. It makes the workflow ID predictable, gives you a Temporal UI deep
@@ -189,7 +251,12 @@ The MCP server has two listeners:
   `/admin/state`, `/admin/control`, `/admin/reset`. **No public domain today**,
   deliberately.
 
-So a browser cannot reach `/admin/live` right now. If your dashboard runs
+So a browser cannot reach `/admin/live` right now.
+
+Related: the board's agent ↔ MCP card now has a working BREAK/FIX pair and its
+votes tally correctly, but the outbound call still goes nowhere, because the MCP
+server has no `/on` or `/off` route. **Do not build dashboard behaviour around
+that component's state until Ian wires it** — the other four are real. If your dashboard runs
 outside this Railway project, Ian will add a public domain on 8081 and share
 the admin bearer.
 
@@ -203,4 +270,4 @@ the same Railway project and skip the exposure entirely.
 
 Alternative that needs nothing exposed: your dashboard's own ledger (§3) plus
 the board's WebSocket (§5) already give you ordered/fulfilled, the gap, and
-switch state. `/admin/live` is a nice-to-have, not a dependency.
+component state. `/admin/live` is a nice-to-have, not a dependency.
