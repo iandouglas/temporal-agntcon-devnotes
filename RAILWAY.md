@@ -38,8 +38,8 @@ The services, and how they talk to each other:
 | `mcp-worker` | [mcp](https://github.com/iandouglas/temporal-agntcon-mcp) | no | The Temporal worker that runs those tool-call workflows |
 | `audience-site` | [audience](https://github.com/iandouglas/temporal-agntcon-audience) | yes | The phone UI the audience taps, and the operator panel |
 | `test-demo` | [testdemo](https://github.com/iandouglas/temporal-agntcon-testdemo) | yes | The rehearsal console with the START THE DEMO button |
-| `agent-worker` | [agntcon-mcpcon-demo](https://github.com/melienherrera/agntcon-mcpcon-demo) | no | The AI ordering agent's Temporal worker. The audience can kill it |
-| `stage-screen` | [agntcon-mcpcon-demo](https://github.com/melienherrera/agntcon-mcpcon-demo) | yes | The projector view: workflow timeline, switches, order counts |
+| `agent-worker` | [agntcon-mcpcon-demo](https://github.com/iandouglas/agntcon-mcpcon-demo) | no | The AI ordering agent's Temporal worker. The audience can kill it |
+| `stage-screen` | [agntcon-mcpcon-demo](https://github.com/iandouglas/agntcon-mcpcon-demo) | yes | The projector view: workflow timeline, switches, order counts |
 
 Our stage instances, until they come down after the event:
 
@@ -209,8 +209,8 @@ never reaches the browser.
 ## Step 8: The Agent Worker and the Stage Screen
 
 Two services from your fork of `agntcon-mcpcon-demo`, both with **Root
-Directory `agent`**, both built from `agent/Dockerfile`. Melissa's
-[DEPLOY.md](https://github.com/melienherrera/agntcon-mcpcon-demo/blob/main/DEPLOY.md)
+Directory `agent`**, both built from `agent/Dockerfile`. The repo's
+[DEPLOY.md](https://github.com/iandouglas/agntcon-mcpcon-demo/blob/main/DEPLOY.md)
 has the detail.
 
 **`agent-worker`**: start command `./scripts/run_worker.sh`, no public domain.

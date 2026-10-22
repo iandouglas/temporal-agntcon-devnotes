@@ -15,7 +15,7 @@ whole stack on a laptop, and explains how to deploy it to Railway.
 | [temporal-agntcon-service](https://github.com/iandouglas/temporal-agntcon-service) | The mock order services the tools call (Go), one image run four times |
 | [temporal-agntcon-audience](https://github.com/iandouglas/temporal-agntcon-audience) | The audience board: the phone UI and the operator panel (TypeScript) |
 | [temporal-agntcon-testdemo](https://github.com/iandouglas/temporal-agntcon-testdemo) | The rehearsal console that opens the floor |
-| [agntcon-mcpcon-demo](https://github.com/melienherrera/agntcon-mcpcon-demo) | The ordering agent and the projector screen (Python) |
+| [agntcon-mcpcon-demo](https://github.com/iandouglas/agntcon-mcpcon-demo) | The ordering agent and the projector screen (Python) |
 | this repo | Local stack script and the Railway guide |
 
 **Deploying it:** see [RAILWAY.md](RAILWAY.md).
