@@ -1,4 +1,36 @@
-# Running the whole thing on a laptop
+# Chaos Engineered: How to Build Invincible Agents and MCP Systems
+
+The demo from our AgntCon / MCPCon North America 2026 talk. The audience breaks
+services from their phones while [Temporal](https://temporal.io) keeps an AI
+agent's order moving. The agent talks to a remote MCP server, and every tool
+call on that server is itself a Temporal workflow, so a broken service makes a
+call slower, never failed.
+
+This repo is the starting point. It ties the other repos together, runs the
+whole stack on a laptop, and explains how to deploy it to Railway.
+
+| Repo | What it is |
+|---|---|
+| [temporal-agntcon-mcp](https://github.com/iandouglas/temporal-agntcon-mcp) | The durable MCP server (Python), plus its Temporal worker |
+| [temporal-agntcon-service](https://github.com/iandouglas/temporal-agntcon-service) | The mock order services the tools call (Go), one image run four times |
+| [temporal-agntcon-audience](https://github.com/iandouglas/temporal-agntcon-audience) | The audience board: the phone UI and the operator panel (TypeScript) |
+| [temporal-agntcon-testdemo](https://github.com/iandouglas/temporal-agntcon-testdemo) | The rehearsal console that opens the floor |
+| [agntcon-mcpcon-demo](https://github.com/melienherrera/agntcon-mcpcon-demo) | The ordering agent and the projector screen (Python) |
+| this repo | Local stack script and the Railway guide |
+
+**Deploying it:** see [RAILWAY.md](RAILWAY.md).
+
+## Running the whole thing on a laptop
+
+`stack.sh` expects the repos cloned side by side, with this one as `dev/`:
+
+```bash
+mkdir agntcon && cd agntcon
+git clone https://github.com/iandouglas/temporal-agntcon-devnotes dev
+git clone https://github.com/iandouglas/temporal-agntcon-mcp mcp
+git clone https://github.com/iandouglas/temporal-agntcon-service service
+git clone https://github.com/iandouglas/temporal-agntcon-audience audience-site
+```
 
 `./dev/stack.sh up` starts every backend piece locally so the audience site can
 be tested against real services, a real MCP server and a real Temporal server.
@@ -20,7 +52,7 @@ No Docker, no Railway, no cloud account.
 
 Logs and pidfiles land in `dev/.run/` (gitignored).
 
-## What it starts
+### What it starts
 
 | Piece | Port | Notes |
 |---|---|---|
@@ -42,7 +74,7 @@ Tokens default to `dev-agent-token` / `dev-admin-token`. Every port and token
 is overridable by exporting it before `up` (see the config block at the top of
 `stack.sh`).
 
-## Two things that will confuse you
+### Two things that will confuse you
 
 **The audience gate defaults to LOCKED.** All five switches are dead on arrival
 until the operator opens the floor — that is deliberate, so a phone that scans
@@ -55,23 +87,20 @@ case the audience site warns about. The board keeps showing its own last known
 position. `./dev/stack.sh reseed` makes it re-read `/health` and catch up.
 Driving switches from `/control` instead keeps the two in step by construction.
 
-## `dev/mcp-switch-shim.mjs`
+### `dev/mcp-switch-shim.mjs`
 
-**A test harness, not part of the demo.** Nothing here is deployed.
+**A legacy test harness, not part of the demo.** Nothing here is deployed.
 
 The audience site drives all five switches identically: `POST {base}/on`,
 `POST {base}/off`, and `GET {base}/health` at cold start. The four Go services
 speak that natively. The MCP server does not — it exposes
 `POST /admin/control {"target":"global","enabled":bool}` and `GET /admin/state`,
-behind an admin bearer token, on its *internal* listener. So the top switch on
-the board currently calls a 404.
+behind an admin bearer token, on its *internal* listener.
 
-The shim translates, so the full board is testable locally. It is also the spec
-for the real fix: either the audience site learns to speak `/admin/control`, or
-the MCP server grows those three routes. See open item 2 in
-`../INTEGRATION-NOTES.md`.
+The audience board now speaks `/admin/control` itself when `mcp_admin_token` is
+set, so the shim is only needed to test the older `/on`/`/off` path.
 
-## Prerequisites
+### Prerequisites
 
 `go`, `node`, `npm`, `uv`, `temporal`, `redis-server`, `curl`, `lsof`.
 `up` checks for all of them and names the missing one. Docker is not needed.
@@ -79,7 +108,7 @@ the MCP server grows those three routes. See open item 2 in
 Node is installed via asdf and is not on the default `PATH`; `stack.sh` adds
 `~/.asdf/shims` itself, but remember it if you run `npm` by hand.
 
-## What `smoke` asserts
+### What `smoke` asserts
 
 1. `/healthz` lists the four tools.
 2. A healthy `order_taco` completes on attempt 1.
@@ -90,3 +119,7 @@ Node is installed via asdf and is not on the default `PATH`; `stack.sh` adds
 Step 3 is the one that matters — it is the claim the whole talk rests on. A
 representative run: *"completed after 6 attempts, with no error surfaced to the
 caller."*
+
+## License
+
+[MIT](LICENSE)
