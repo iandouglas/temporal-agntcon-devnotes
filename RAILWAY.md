@@ -102,24 +102,45 @@ without touching code.
 | Variable | Value |
 |---|---|
 | `DB` | `postgres12` |
-| `DB_PORT` | `${{Postgres.PGPORT}}` |
+| `DB_PORT` | `5432` |
+| `POSTGRES_SEEDS` | `postgres.railway.internal` |
 | `POSTGRES_USER` | `${{Postgres.PGUSER}}` |
 | `POSTGRES_PWD` | `${{Postgres.PGPASSWORD}}` |
-| `POSTGRES_SEEDS` | `${{Postgres.PGHOST}}` |
-| `DYNAMIC_CONFIG_FILE_PATH` | `config/dynamicconfig/development-sql.yaml` |
+| `DBNAME` | `temporal` |
+| `VISIBILITY_DBNAME` | `temporal_visibility` |
+| `ENABLE_ES` | `false` (visibility on Postgres, no Elasticsearch) |
+| `BIND_ON_IP` | `0.0.0.0` |
+| `DYNAMIC_CONFIG_FILE_PATH` | `/etc/temporal/dynamicconfig/development-sql.yaml` |
+| `DEFAULT_NAMESPACE` | `default` |
+| `DEFAULT_NAMESPACE_RETENTION` | `24h` |
+| `SKIP_DEFAULT_NAMESPACE_CREATION` | `false` |
+| `LOG_LEVEL` | `info` |
 
 - Attach a volume (ours is `temporal-dynamicconfig`) at
-  `/etc/temporal/config/dynamicconfig`. Railway can't mount a file from a repo,
+  `/etc/temporal/dynamicconfig`. Railway can't mount a file from a repo,
   so the dynamic config file lives on a volume.
 - No public domain. Everything reaches it over the private network at
   `temporal.railway.internal:7233`, with no TLS and no API key.
-- `auto-setup` creates the `default` namespace on first boot. Visibility runs
-  on Postgres too, which the stage screen needs to count orders.
+- `auto-setup` creates both databases and the `default` namespace on first
+  boot. Visibility runs on Postgres too, which the stage screen needs to
+  count orders. A 24h retention keeps a day of rehearsal history and no more.
 - Give it more room than the rest: we ran it at 4 vCPU / 8 GB, everything else
   at 2 vCPU / 2 GB.
 
-**`temporal-ui`**: deploy `temporalio/ui` with
-`TEMPORAL_ADDRESS=temporal.railway.internal:7233`, and give it a public domain.
+**`temporal-ui`**: deploy `temporalio/ui:2.55.0`, and give it a public domain.
+
+| Variable | Value |
+|---|---|
+| `TEMPORAL_ADDRESS` | `temporal.railway.internal:7233` |
+| `TEMPORAL_DEFAULT_NAMESPACE` | `default` |
+| `TEMPORAL_UI_PORT` | `8080` |
+| `TEMPORAL_CSRF_COOKIE_INSECURE` | `true` |
+
+Pin a version, and make it **2.34.6 or later**. The agent labels every step
+("place order", "agent call 2", "Order Taco") with an
+[activity summary](https://docs.temporal.io/develop/python/platform/enriching-ui),
+and older UI versions don't draw them: the Timeline just repeats
+`call_richards_tool`. We started on 2.30.0 and hit exactly that.
 
 > **The Temporal UI has no login by default.** Anyone with its URL can see
 > and terminate workflows. That was fine for a talk. For anything longer-lived,
